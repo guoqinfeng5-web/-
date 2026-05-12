@@ -1,7 +1,7 @@
 package com.demo.service;
 
 import com.demo.memory.ChatMessage;
-import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.chat.ChatModel;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
@@ -11,7 +11,7 @@ import java.util.List;
 @RequiredArgsConstructor
 public class LlmSummaryService {
 
-    private final ChatLanguageModel chatLanguageModel;
+    private final ChatModel chatModel;
 
     /**
      * 对历史对话做精简摘要，保留关键问题与偏好信息。
@@ -25,7 +25,7 @@ public class LlmSummaryService {
             sb.append(msg.getRole()).append("：").append(msg.getContent()).append("\n");
         }
 
-        return chatLanguageModel.generate(sb.toString());
+        return chatModel.chat(sb.toString());
     }
 }
 

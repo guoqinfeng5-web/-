@@ -1,5 +1,6 @@
 package com.demo.controller;
 
+import com.demo.common.AppConstants;
 import com.demo.service.AiService;
 import com.smartlibrary.common.Result;
 import lombok.RequiredArgsConstructor;
@@ -16,8 +17,10 @@ public class AiController {
     private final AiService aiService;
 
     @GetMapping("/analyze")
-    public Result<String> analyze(@RequestParam(value = "question") String question) {
-        return aiService.analyze(question);
+    public Result<String> analyze(@RequestParam(value = "question") String question,
+                                  @RequestParam(value = "debug", required = false,
+                                          defaultValue = AppConstants.API_AI_ANALYZE_DEBUG_DEFAULT) boolean debug) {
+        return aiService.analyze(question, debug);
     }
 }
 

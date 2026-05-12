@@ -26,7 +26,8 @@ class AiControllerTest {
 
     @Test
     void analyze_shouldReturnOkResult() throws Exception {
-        when(aiService.analyze(eq("推荐一本适合初学者的Java书")))
+        // Controller 里 debug 默认值为 true；这里需与之保持一致，否则 mock 不命中会导致响应体为空
+        when(aiService.analyze(eq("推荐一本适合初学者的Java书"), eq(true)))
                 .thenReturn(Result.ok("mock-answer"));
 
         mockMvc.perform(get("/api/ai/analyze")

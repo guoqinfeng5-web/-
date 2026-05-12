@@ -12,31 +12,28 @@ import lombok.NoArgsConstructor;
 import java.time.LocalDateTime;
 
 /**
- * 用户活动记录实体：user_activities。
+ * 借阅记录实体，映射表 {@code borrow_records}。
  */
 @Data
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@TableName("user_activities")
-public class UserActivity {
+@TableName("borrow_records")
+public class BorrowRecord {
 
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;
 
-    @TableField("user_id")
-    private Long userId;
-
     @TableField("book_id")
     private Long bookId;
 
-    /**
-     * 行为类型: 1-查看, 2-收藏, 3-借阅
-     */
-    @TableField("activity_type")
-    private Integer activityType;
+    @TableField("user_id")
+    private Long userId;
 
-    @TableField("create_time")
-    private LocalDateTime createTime;
+    @TableField("borrow_time")
+    private LocalDateTime borrowTime;
+
+    /** 未归还时为 null */
+    @TableField("return_time")
+    private LocalDateTime returnTime;
 }
-

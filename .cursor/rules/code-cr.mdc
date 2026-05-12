@@ -323,3 +323,5 @@ public void createUser() {
 
 - **测试代码**: 关注测试覆盖率和测试质量
 
+## 参考资源
+ - [单元测试规范.mdc] 文件路径为D:\Graduate2\java\cursor\demo\.cursor\rules\单元测试规范.mdc

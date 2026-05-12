@@ -1,13 +1,12 @@
 package com.demo.mapper;
 
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
-import com.demo.entity.UserActivity;
+import com.demo.entity.BorrowRecord;
 import org.apache.ibatis.annotations.Mapper;
 
 /**
- * 用户活动记录 Mapper。
+ * 借阅记录 Mapper。
  */
 @Mapper
-public interface UserActivityMapper extends BaseMapper<UserActivity> {
+public interface BorrowRecordMapper extends BaseMapper<BorrowRecord> {
 }
-

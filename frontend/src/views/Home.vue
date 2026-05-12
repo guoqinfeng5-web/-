@@ -19,7 +19,7 @@ const chatMessages = ref([
   },
 ])
 const chatBodyRef = ref(null)
-const thinkingTips = ['正在检索数据库...', '正在分析语义...', 'AI 正在组织语言...']
+const thinkingTips = ['正在检索数据库...', '正在检索数据库...']
 const thinkingTipIndex = ref(0)
 let thinkingTimer = null
 
@@ -239,7 +239,7 @@ onBeforeUnmount(() => {
           <el-table-column prop="author" label="作者" min-width="120" />
           <el-table-column prop="category" label="分类" min-width="120" />
           <el-table-column prop="score" label="评分" min-width="80" />
-          <el-table-column prop="borrowCount" label="点击量" min-width="90" />
+          <el-table-column prop="borrowCount" label="借阅次数" min-width="90" />
         </el-table>
 
         <div class="pager-wrap">

@@ -1,47 +1,92 @@
 package com.demo.service;
 
-import com.demo.entity.Book;
+import com.demo.common.AppConstants;
 import com.demo.memory.ChatMessage;
 import com.smartlibrary.common.Result;
-import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.chat.ChatModel;
 import lombok.RequiredArgsConstructor;
-import org.springframework.data.redis.core.RedisTemplate;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedHashMap;
+import jakarta.annotation.PostConstruct;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class AiService {
 
-    private static final String DEMO_SESSION_ID = "demo_user_001";
-    private static final String HISTORY_KEY_PREFIX = "ai:chat:history:v2:";
-    private static final int MAX_HISTORY_MESSAGES = 10;
-    private static final String SOURCE_TAG = "[数据来源：馆藏库]";
-    private static final String SYSTEM_PERSONA = "你是“智能图书管员”，首要任务是帮用户找书，但你也是一个博学、温暖的伙伴。";
-
     private final BookService bookService;
-    private final ChatLanguageModel chatLanguageModel;
-    private final RedisTemplate<String, Object> redisTemplate;
-    private final LlmSummaryService llmSummaryService;
+    private final ChatModel chatModel;
+    private final VectorStoreService vectorStoreService;
+    private final ChatMemoryService chatMemoryService;
+    private final LibraryAnalyticsAnswerService libraryAnalyticsAnswerService;
+
+    @PostConstruct
+    public void initVectorStore() {
+        try {
+            vectorStoreService.ingest(bookService.list());
+            log.info("Vector store initialized with books from database.");
+        } catch (Exception e) {
+            log.warn("Vector store initialization failed, AI will degrade gracefully.", e);
+        }
+    }
 
     public Result<String> analyze(String question) {
+        return analyze(question, false);
+    }
+
+    public Result<String> analyze(String question, boolean debug) {
         if (question == null || question.isBlank()) {
             return Result.fail(400, "question 不能为空");
         }
 
         String cleanQuestion = question.trim();
-        String historyKey = HISTORY_KEY_PREFIX + DEMO_SESSION_ID;
-        List<ChatMessage> memoryHistory = loadHistorySafely(historyKey);
-        memoryHistory = compressHistoryIfNeeded(historyKey, memoryHistory);
+        List<ChatMessage> memoryHistory = chatMemoryService.loadAndCompressHistory(AppConstants.DEMO_SESSION_ID);
+        String memoryContext = chatMemoryService.buildMemoryContext(memoryHistory);
 
-        List<Book> books = bookService.list();
-        String ragContext = buildContext(books);
-        String memoryContext = buildMemoryContext(memoryHistory);
+        Optional<String> analyticsAnswer = libraryAnalyticsAnswerService.tryAnswer(cleanQuestion);
+        if (analyticsAnswer.isPresent()) {
+            String a = sanitizeLeakedReasoning(analyticsAnswer.get());
+            if (!a.isEmpty()) {
+                String out = ensureAnalyticsSourceTag(a);
+                chatMemoryService.saveTurnSafelyAsync(AppConstants.DEMO_SESSION_ID, cleanQuestion, out);
+                return Result.ok(out);
+            }
+        }
+
+        // 用户显式使用 /查询 /query 时，表示强制走 NL2SQL；不应再回退到 RAG 产生“隐私拒绝”等误导话术
+        String lower = cleanQuestion.toLowerCase(Locale.ROOT);
+        if (cleanQuestion.startsWith(AppConstants.FORCE_ANALYTICS_PREFIX_CN)
+                || lower.startsWith(AppConstants.FORCE_ANALYTICS_PREFIX_EN)) {
+            return Result.ok("统计分析链路未返回结果：请检查服务日志（是否成功调用到统计助手与 queryLibraryDatabase），以及数据库是否可连接。");
+        }
+
+        boolean factIntent = isFactIntent(cleanQuestion);
+        boolean chitchatIntent = isChitchatIntent(cleanQuestion);
+        boolean likelyBookIntent = isLikelyBookIntent(cleanQuestion);
+
+        List<VectorStoreService.SearchHit> searchHits = List.of();
+        // 只有“纯闲聊”（命中闲聊但不含任何图书/事实检索意图）才跳过检索；
+        // 情绪表达 + 找书/问作者/问库存 等混合问题，也应检索以减少幻觉。
+        boolean pureChitchat = chitchatIntent && !likelyBookIntent && !factIntent;
+        boolean shouldSearchRag = !pureChitchat && (likelyBookIntent || factIntent);
+        if (shouldSearchRag) {
+            try {
+                searchHits = vectorStoreService.hybridSearch(cleanQuestion, AppConstants.RAG_HYBRID_TOP_K, debug);
+            } catch (Exception e) {
+                log.warn("Vector search failed, fallback without RAG context.", e);
+            }
+        }
+
+        boolean hasStrongContext = hasStrongContext(searchHits);
+        boolean useCatalogContext = shouldSearchRag && hasStrongContext;
+        String ragContext = useCatalogContext ? buildRagContext(searchHits) : "（本次未使用馆藏检索上下文）";
+        String ragPolicy = useCatalogContext
+                ? "本次检索结果可信，请优先依据 [RAG 馆藏背景] 作答。"
+                : "本次检索结果弱相关或用户偏闲聊，请降低对 [RAG 馆藏背景] 的依赖，自然回答即可。";
 
         String prompt = """
                 [系统指令]
@@ -51,11 +96,7 @@ public class AiService {
                 - 意图 B（事实细节类图书咨询）
                 - 意图 C（日常社交/通用咨询）
                 如果用户只是打招呼、情绪表达或闲聊，可跳过馆藏检索，直接自然交流。
-
-                以下是目前数据库中的可用书籍信息：
                 %s
-
-                用户提问：‘%s’
 
                 【输出格式动态指令】
                 请先判断用户提问意图，再选择输出风格：
@@ -84,6 +125,14 @@ public class AiService {
                 2) 图书相关回答优先参考 [RAG 馆藏背景] 与 [历史记忆]；若用户聊非图书话题，可使用通用知识自然作答。
                 3) 如确实使用了馆藏数据，书名或数据点后追加“[数据来源：馆藏库]”。
                 4) 不要机械回复“馆藏信息不足”，应给用户下一步可执行引导。
+                4.1) 严禁编造馆藏：当用户问“有没有/是否有某作者/某书名/某标签的书”“馆里有吗”等可被视为馆藏存在性判断的问题时，
+                     只有在 [RAG 馆藏背景] 或 [历史记忆] 中出现了对应作者/书名/证据，才允许断言“馆内有/有收录/有库存”；
+                     若未出现证据，必须明确回答“本次馆藏检索未命中”，并从已检索到的相关书中给出替代建议，或引导用户使用 `/查询` 做精确检索。
+                5) 涉及数量时严格区分口径，勿混用「本 / 种 / 册 / 分类」：
+                   - 「种」「书目」：馆藏里有多少个不同的书目条目（一种书一条记录）；不要说成「本」若实际指条目数。
+                   - 「册」：库存/复本总量（若上下文或字段能体现 stock 再谈册数；RAG 片段未给 stock 时不要编造总册数）。
+                   - 「分类」：category 维度，与「多少种书」不是同一概念。
+                   - 用户只问「多少本书」且背景只有书目条数时，优先答「共 N 种书目」或「N 条馆藏记录」，并说明若需总册数需按库存汇总。
 
                 [RAG 馆藏背景]
                 %s
@@ -93,23 +142,36 @@ public class AiService {
 
                 [当前用户问题]
                 %s
-                """.formatted(SYSTEM_PERSONA, ragContext, cleanQuestion, ragContext, memoryContext, cleanQuestion);
+                """.formatted(AppConstants.SYSTEM_PERSONA, ragPolicy, ragContext, memoryContext, cleanQuestion);
 
-        String answer = chatLanguageModel.generate(prompt);
-        answer = postProcessAnswer(cleanQuestion, answer);
-        saveTurnSafely(historyKey, cleanQuestion, answer);
-        return Result.ok(answer);
+        try {
+            String answer = chatModel.chat(prompt);
+            answer = postProcessAnswer(cleanQuestion, answer, useCatalogContext, factIntent, chitchatIntent, likelyBookIntent);
+            chatMemoryService.saveTurnSafelyAsync(AppConstants.DEMO_SESSION_ID, cleanQuestion, answer);
+            return Result.ok(answer);
+        } catch (Exception e) {
+            log.warn("chatModel.chat 调用失败，将返回降级答复: {}", e.toString(), e);
+            String fallback = """
+                    我这边刚刚连接外部大模型服务时遇到了一点波动，暂时没能稳定生成回答。
+
+                    你可以：
+                    - 过几秒再试一次
+                    - 或者把问题换一种说法（更具体一点）
+
+                    如果你现在想问馆藏/借阅/库存等统计问题，也可以用 `/查询` 开头，我会走数据库统计链路更稳定地帮你查。
+                    """.trim();
+            // 降级答复也保存，保证对话不断档
+            chatMemoryService.saveTurnSafelyAsync(AppConstants.DEMO_SESSION_ID, cleanQuestion, fallback);
+            return Result.ok(fallback);
+        }
     }
 
-    private String postProcessAnswer(String question, String rawAnswer) {
-        String answer = rawAnswer == null ? "" : rawAnswer.trim();
+    private String postProcessAnswer(String question, String rawAnswer, boolean useCatalogContext,
+                                     boolean factIntent, boolean chitchatIntent, boolean likelyBookIntent) {
+        String answer = sanitizeLeakedReasoning(rawAnswer);
         if (answer.isEmpty()) {
             return "我还不太确定你的具体需求。你可以告诉我想看的书名、作者或分类，我可以继续帮你。";
         }
-
-        boolean factIntent = isFactIntent(question);
-        boolean chitchatIntent = isChitchatIntent(question);
-        boolean likelyBookIntent = isLikelyBookIntent(question);
         if (factIntent) {
             answer = removeTemplateHeadings(answer);
         }
@@ -118,41 +180,34 @@ public class AiService {
             return answer;
         }
 
-        return ensureSourceTagIfBookAnswer(answer, question);
+        return ensureSourceTagIfBookAnswer(answer, question, useCatalogContext);
+    }
+
+    private String ensureAnalyticsSourceTag(String answer) {
+        if (answer.contains(AppConstants.SOURCE_TAG)) {
+            return answer;
+        }
+        return answer + " " + AppConstants.SOURCE_TAG;
     }
 
     private boolean isFactIntent(String question) {
-        String q = question == null ? "" : question.toLowerCase(Locale.ROOT);
-        String[] keywords = {
-                "价格", "多少钱", "价位", "作者", "出版", "isbn", "库存", "借阅", "借了多少", "borrow",
-                "score", "评分", "分类", "在哪", "位置", "馆藏", "有几本", "数量"
-        };
-        for (String keyword : keywords) {
-            if (q.contains(keyword)) return true;
-        }
-        return false;
+        return containsAnyKeyword(question, AppConstants.RAG_FACT_INTENT_KEYWORDS);
     }
 
     private boolean isChitchatIntent(String question) {
-        String q = question == null ? "" : question.toLowerCase(Locale.ROOT);
-        String[] keywords = {
-                "你好", "嗨", "hello", "hi", "你是谁", "谢谢", "感谢", "在吗", "早上好", "晚上好",
-                "心情不好", "难过", "焦虑", "聊聊", "随便聊", "无聊", "最近怎么样"
-        };
-        for (String keyword : keywords) {
-            if (q.contains(keyword)) return true;
-        }
-        return false;
+        return containsAnyKeyword(question, AppConstants.RAG_CHITCHAT_INTENT_KEYWORDS);
     }
 
     private boolean isLikelyBookIntent(String question) {
+        return containsAnyKeyword(question, AppConstants.RAG_LIKELY_BOOK_INTENT_KEYWORDS);
+    }
+
+    private static boolean containsAnyKeyword(String question, List<String> keywords) {
         String q = question == null ? "" : question.toLowerCase(Locale.ROOT);
-        String[] keywords = {
-                "书", "图书", "推荐", "作者", "分类", "评分", "借阅", "库存", "馆藏",
-                "price", "borrow", "isbn", "title", "book"
-        };
         for (String keyword : keywords) {
-            if (q.contains(keyword)) return true;
+            if (q.contains(keyword)) {
+                return true;
+            }
         }
         return false;
     }
@@ -165,175 +220,58 @@ public class AiService {
                 .trim();
     }
 
-    private String ensureSourceTagIfBookAnswer(String answer, String question) {
+    private String ensureSourceTagIfBookAnswer(String answer, String question, boolean useCatalogContext) {
+        if (!useCatalogContext) return answer;
         if (!isLikelyBookIntent(question)) return answer;
-        if (answer.contains(SOURCE_TAG)) return answer;
-        return answer + " " + SOURCE_TAG;
+        if (answer.contains(AppConstants.SOURCE_TAG)) return answer;
+        return answer + " " + AppConstants.SOURCE_TAG;
     }
 
-    private List<ChatMessage> loadHistorySafely(String historyKey) {
-        try {
-            List<Object> raw = redisTemplate.opsForList().range(historyKey, 0, -1);
-            if (raw == null || raw.isEmpty()) return new ArrayList<>();
-
-            List<ChatMessage> result = new ArrayList<>(raw.size());
-            for (Object obj : raw) {
-                ChatMessage msg = convertToChatMessage(obj);
-                if (msg != null) result.add(msg);
-            }
-            return result;
-        } catch (Exception ignored) {
-            // Redis 不可用时降级为无记忆模式
-            return new ArrayList<>();
+    private String sanitizeLeakedReasoning(String rawAnswer) {
+        String answer = rawAnswer == null ? "" : rawAnswer.trim();
+        if (answer.isEmpty()) {
+            return "";
         }
-    }
 
-    private List<ChatMessage> compressHistoryIfNeeded(String historyKey, List<ChatMessage> history) {
-        try {
-            if (history.size() <= MAX_HISTORY_MESSAGES || history.size() < 2) {
-                return history;
+        // Prefer preserving the main user-facing answer and cutting off trailing reasoning/log artifacts.
+        for (String marker : AppConstants.RAG_OUTPUT_CUT_MARKERS) {
+            int idx = answer.indexOf(marker);
+            if (idx > 0) {
+                answer = answer.substring(0, idx).trim();
             }
-
-            int half = history.size() / 2;
-            if (half <= 0) return history;
-
-            List<ChatMessage> firstHalf = history.subList(0, half);
-            String summary = llmSummaryService.generateSummary(firstHalf);
-            ChatMessage summaryMessage = new ChatMessage();
-            summaryMessage.setRole("system");
-            summaryMessage.setContent("SUMMARY: " + (summary == null ? "" : summary.trim()));
-            summaryMessage.setTimestamp(System.currentTimeMillis());
-
-            redisTemplate.opsForList().trim(historyKey, half, -1);
-            redisTemplate.opsForList().leftPush(historyKey, summaryMessage);
-
-            List<Object> refreshed = redisTemplate.opsForList().range(historyKey, 0, -1);
-            if (refreshed == null || refreshed.isEmpty()) {
-                return Collections.singletonList(summaryMessage);
-            }
-
-            List<ChatMessage> result = new ArrayList<>(refreshed.size());
-            for (Object obj : refreshed) {
-                ChatMessage msg = convertToChatMessage(obj);
-                if (msg != null) result.add(msg);
-            }
-            return result;
-        } catch (Exception ignored) {
-            // Redis 或摘要过程失败时，保持原有历史继续工作
-            return history;
         }
+
+        // Remove common chain-of-thought wrappers if the model accidentally returns them.
+        answer = answer
+                .replace("<think>", "")
+                .replace("</think>", "")
+                .replace("```json", "")
+                .replace("```", "")
+                .trim();
+
+        return answer;
     }
 
-    private String buildMemoryContext(List<ChatMessage> history) {
-        if (history == null || history.isEmpty()) {
-            return "（暂无历史记忆）";
+    private boolean hasStrongContext(List<VectorStoreService.SearchHit> hits) {
+        if (hits == null || hits.isEmpty()) {
+            return false;
+        }
+        return hits.stream().anyMatch(hit -> hit.score() >= AppConstants.MIN_VECTOR_SCORE);
+    }
+
+    private String buildRagContext(List<VectorStoreService.SearchHit> hits) {
+        if (hits == null || hits.isEmpty()) {
+            return "（检索结果为空）";
         }
         StringBuilder sb = new StringBuilder();
-        for (ChatMessage msg : history) {
-            if (msg == null) continue;
-            sb.append(msg.getRole()).append("：").append(msg.getContent()).append("\n");
+        for (VectorStoreService.SearchHit hit : hits) {
+            sb.append("- score=")
+                    .append(String.format(Locale.ROOT, "%.4f", hit.score()))
+                    .append("; segment=")
+                    .append(hit.text())
+                    .append('\n');
         }
         return sb.toString().trim();
-    }
-
-    private void saveTurnSafely(String historyKey, String userQuestion, String aiAnswer) {
-        try {
-            ChatMessage userMsg = new ChatMessage();
-            userMsg.setRole("user");
-            userMsg.setContent(userQuestion);
-            userMsg.setTimestamp(System.currentTimeMillis());
-
-            ChatMessage aiMsg = new ChatMessage();
-            aiMsg.setRole("assistant");
-            aiMsg.setContent(aiAnswer);
-            aiMsg.setTimestamp(System.currentTimeMillis());
-
-            redisTemplate.opsForList().rightPush(historyKey, userMsg);
-            redisTemplate.opsForList().rightPush(historyKey, aiMsg);
-        } catch (Exception ignored) {
-            // Redis 不可用时降级为无记忆模式
-        }
-    }
-
-    private ChatMessage convertToChatMessage(Object obj) {
-        if (obj == null) return null;
-        if (obj instanceof ChatMessage) return (ChatMessage) obj;
-
-        if (obj instanceof LinkedHashMap<?, ?> map) {
-            ChatMessage msg = new ChatMessage();
-            Object role = map.get("role");
-            Object content = map.get("content");
-            Object timestamp = map.get("timestamp");
-            msg.setRole(role == null ? "assistant" : role.toString());
-            msg.setContent(content == null ? "" : content.toString());
-            msg.setTimestamp(parseLong(timestamp));
-            return msg;
-        }
-
-        ChatMessage fallback = new ChatMessage();
-        fallback.setRole("assistant");
-        fallback.setContent(obj.toString());
-        fallback.setTimestamp(System.currentTimeMillis());
-        return fallback;
-    }
-
-    private long parseLong(Object value) {
-        if (value == null) return System.currentTimeMillis();
-        if (value instanceof Number number) return number.longValue();
-        try {
-            return Long.parseLong(value.toString());
-        } catch (Exception ignored) {
-            return System.currentTimeMillis();
-        }
-    }
-
-    private String buildContext(List<Book> books) {
-        if (books == null || books.isEmpty()) {
-            return "（当前数据库暂无书籍数据）";
-        }
-
-        int maxBooks = 80;
-        int maxSummaryChars = 400;
-        int maxContextChars = 12000;
-
-        StringBuilder sb = new StringBuilder(Math.min(maxContextChars, 4096));
-        int count = 0;
-
-        for (Book b : books) {
-            if (b == null) continue;
-            if (count >= maxBooks) break;
-            if (sb.length() >= maxContextChars) break;
-
-            String title = safeOneLine(b.getTitle());
-            String author = safeOneLine(b.getAuthor());
-            String category = safeOneLine(b.getCategory());
-            String summary = safeOneLine(b.getSummary());
-            if (summary.length() > maxSummaryChars) {
-                summary = summary.substring(0, maxSummaryChars) + "...";
-            }
-
-            sb.append("- title: ").append(title)
-              .append("; author: ").append(author)
-              .append("; category: ").append(category)
-              .append("; summary: ").append(summary)
-              .append('\n');
-
-            count++;
-        }
-
-        if (sb.length() > maxContextChars) {
-            sb.setLength(maxContextChars);
-        }
-
-        return sb.toString().trim();
-    }
-
-    private String safeOneLine(String s) {
-        if (s == null) return "";
-        return s.replace('\r', ' ')
-                .replace('\n', ' ')
-                .replace('\t', ' ')
-                .trim();
     }
 }
 
