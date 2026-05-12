@@ -39,15 +39,15 @@
 
 ```mermaid
 flowchart TD
-User[User] --> Frontend[Frontend(Home.vue)]
-Frontend -->|GET /api/ai/analyze?question=...| AiController[AiController]
+User[User] --> Frontend["Frontend(Home.vue)"]
+Frontend -->|"GET /api/ai/analyze?question=..."| AiController[AiController]
 AiController --> AiService[AiService]
 
 AiService -->|/查询 或 统计意图| AnalyticsService[LibraryAnalyticsAnswerService]
-AnalyticsService --> AnalyticsAssistant[LibraryAnalyticsAssistant(AiServices)]
+AnalyticsService --> AnalyticsAssistant["LibraryAnalyticsAssistant(AiServices)"]
 AnalyticsAssistant --> Tool[queryLibraryDatabase Tool]
 Tool --> SqlValidator[ReadOnlySqlValidator]
-SqlValidator --> Jdbc[JdbcTemplate(MySQL)]
+SqlValidator --> Jdbc["JdbcTemplate(MySQL)"]
 Jdbc --> Tool --> AnalyticsAssistant --> AnalyticsService --> AiService --> Frontend
 
 AiService -->|否则走 RAG/闲聊| Vss[VectorStoreService.hybridSearch]
