@@ -19,9 +19,9 @@ server:
 spring:
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://127.0.0.1:3306/demo?useSSL=false&serverTimezone=UTC&characterEncoding=utf8
+    url: jdbc:
     username: root
-    password: 2117563882fgq
+    password:
 mybatis-plus:
   mapper-locations: classpath*:/mapper/**/*.xml
   configuration:
@@ -88,7 +88,7 @@ langchain4j:
   open-ai:
     chat-model:
       base-url: "https://api-inference.modelscope.cn/v1/"
-      api-key: "ms-fe1d4ab5-9429-4fb2-8903-42267865d477"
+      api-key: 
       model-name: "Qwen/Qwen3.5-35B-A3B"
       log-requests: true
       log-responses: true
@@ -156,7 +156,7 @@ langchain4j:
   redis:
     host: 127.0.0.1
     port: 6379
-    password: 2117563882
+    password: 
     lettuce:
       pool:
         max-active: 10
@@ -196,7 +196,7 @@ langchain4j:
 【1. 新增 VectorStoreService.java (情报部门)】
 配置模型：使用 DashScopeEmbeddingModel，配置如下：
 
-apiKey: "sk-009cb31ec167429caffd9df67a07d6ad"
+apiKey:
 
 modelName: "text-embedding-v4"
 
